@@ -1,6 +1,8 @@
+use core::str;
 use std::collections::{hash_map::Entry, HashMap};
 
 use super::archi::{Immediate, Instruction, ProgramAddress};
+use std::ops::Range;
 
 #[derive(Debug)]
 pub enum AssemblyErrorKind {
@@ -16,51 +18,11 @@ pub struct AssemblyError {
     pub line: usize,
 }
 
-fn assert_operand_exists(op: Option<&str>, linum: usize) -> Result<&str, AssemblyError> {
-    op.ok_or(AssemblyError {
-        kind: AssemblyErrorKind::WrongArity {
-            expected: 1,
-            got: 0,
-        },
-        line: linum,
-    })
-}
-
-fn parse_immediate(op: Option<&str>, linum: usize) -> Result<Immediate, AssemblyError> {
-    let operand = assert_operand_exists(op, linum)?;
+fn parse_immediate(operand: &str, linum: usize) -> Result<Immediate, AssemblyError> {
     operand.parse::<Immediate>().map_err(|_| AssemblyError {
         kind: AssemblyErrorKind::InvalidNumber(operand.to_string()),
         line: linum,
     })
-}
-
-fn parse_address(
-    op: Option<&str>,
-    linum: usize,
-    inst_count: ProgramAddress,
-    addresses_by_label: &mut HashMap<String, Fix>,
-) -> Result<ProgramAddress, AssemblyError> {
-    let operand = assert_operand_exists(op, linum)?;
-    if operand.starts_with('@') {
-        let label = &operand[1..operand.len()];
-        match addresses_by_label.get_mut(label) {
-            None => {
-                addresses_by_label.insert(label.to_string(), Fix::new_with_fix(None, inst_count));
-                return Ok(0);
-            }
-            Some(fix) => {
-                fix.to_fix.push(inst_count);
-                return Ok(fix.address.unwrap_or_default());
-            }
-        }
-    } else {
-        operand
-            .parse::<ProgramAddress>()
-            .map_err(|_| AssemblyError {
-                kind: AssemblyErrorKind::InvalidNumber(operand.to_string()),
-                line: linum,
-            })
-    }
 }
 
 struct Fix {
@@ -84,74 +46,145 @@ impl Fix {
     }
 }
 
+struct Tokenizer {
+    char_index: usize,
+    last_token: usize,
+    line_num: usize,
+}
+
+impl Tokenizer {
+    fn consume_comment(&mut self, source: &[u8]) {
+        while self.char_index < source.len() && source[self.char_index] != b'\n' {
+            self.char_index += 1;
+        }
+    }
+
+    fn next_token(&mut self, source: &[u8]) -> Range<usize> {
+        while self.char_index < source.len() - 1
+            && (self.char_index < self.last_token
+                || (source[self.char_index] != b' ' && source[self.char_index] != b'\n'))
+        {
+            self.char_index += 1;
+        }
+        let tok = self.last_token..self.char_index;
+        self.last_token = self.char_index + 1;
+        if self.last_token >= source.len() {
+            self.char_index = self.last_token;
+        }
+        tok
+    }
+
+    fn next_token_slice<'a>(&mut self, source: &'a [u8]) -> &'a str {
+        str::from_utf8(&source[self.next_token(source)]).expect("valid utf8")
+    }
+
+    fn parse_address<'a>(
+        &self,
+        operand: &'a str,
+        inst_count: ProgramAddress,
+        fixes_by_label: &mut HashMap<&'a str, Fix>,
+    ) -> Result<ProgramAddress, AssemblyError> {
+        if operand.starts_with('@') {
+            let label = &operand[1..operand.len()];
+            match fixes_by_label.get_mut(label) {
+                None => {
+                    fixes_by_label.insert(label, Fix::new_with_fix(None, inst_count));
+                    return Ok(0);
+                }
+                Some(fix) => {
+                    fix.to_fix.push(inst_count);
+                    return Ok(fix.address.unwrap_or_default());
+                }
+            }
+        } else {
+            operand
+                .parse::<ProgramAddress>()
+                .map_err(|_| AssemblyError {
+                    kind: AssemblyErrorKind::InvalidNumber(operand.to_string()),
+                    line: self.line_num,
+                })
+        }
+    }
+}
+
 pub fn code_from_str(src: &str, dst: &mut [Instruction]) -> Result<ProgramAddress, AssemblyError> {
-    let mut fixes_by_label: HashMap<String, Fix> = HashMap::new();
+    let mut tokenizer = Tokenizer {
+        char_index: 0,
+        last_token: 0,
+        line_num: 0,
+    };
     let mut inst_count: ProgramAddress = 0;
-    for (linum, line) in src.lines().enumerate() {
-        let line = line.trim();
-        if line.starts_with(';') {
-            continue;
-        }
-        if inst_count >= (dst.len() as ProgramAddress) {
-            return Err(AssemblyError {
-                kind: AssemblyErrorKind::CodeTooBig,
-                line: linum,
-            });
-        }
-        let mut words = line.split_whitespace();
-        match words.nth(0) {
-            None => {}
-            Some(s) => {
-                dst[inst_count as usize] = match s {
-                    "halt" => Instruction::Halt,
-                    "noop" => Instruction::Noop,
-                    "load" => Instruction::LoadImmediate(parse_immediate(words.nth(0), linum)?),
-                    "push" => Instruction::Push,
-                    "pop" => Instruction::Pop,
-                    "dup" => Instruction::Dup,
-                    "swap" => Instruction::Swap,
-                    "ldt" => Instruction::LoadTop,
-                    "over" => Instruction::Over,
-                    "inc" => Instruction::Inc,
-                    "dec" => Instruction::Dec,
-                    "add" => Instruction::Add,
-                    "sub" => Instruction::Sub,
-                    "mul" => Instruction::Mul,
-                    "div" => Instruction::Div,
-                    "eq" => Instruction::Eq,
-                    "neq" => Instruction::Neq,
-                    "lt" => Instruction::Lt,
-                    "lte" => Instruction::Lte,
-                    "gt" => Instruction::Gt,
-                    "gte" => Instruction::Gte,
-                    "inv" => Instruction::Inv,
-                    "jmp" => Instruction::Jmp(parse_address(
-                        words.nth(0),
-                        linum,
-                        inst_count,
-                        &mut fixes_by_label,
+    let mut fixes_by_label: HashMap<&str, Fix> = HashMap::new();
+    let source = src.as_bytes();
+
+    while tokenizer.char_index < source.len() {
+        match source[tokenizer.char_index] {
+            b';' => tokenizer.consume_comment(source),
+            b' ' | b'\n' => {
+                let cmd = &source[tokenizer.next_token(source)];
+                dst[inst_count as usize] = match cmd {
+                    b"" => { continue; },
+                    b"halt" => Instruction::Halt,
+                    b"noop" => Instruction::Noop,
+                    b"load" => Instruction::LoadImmediate(parse_immediate(
+                        tokenizer.next_token_slice(source),
+                        tokenizer.line_num,
                     )?),
-                    "jz" => Instruction::JumpIfZero(parse_address(
-                        words.nth(0),
-                        linum,
-                        inst_count,
-                        &mut fixes_by_label,
-                    )?),
-                    "jnz" => Instruction::JumpIfNotZero(parse_address(
-                        words.nth(0),
-                        linum,
-                        inst_count,
-                        &mut fixes_by_label,
-                    )?),
-                    "call" => Instruction::Call(parse_address(
-                        words.nth(0),
-                        linum,
-                        inst_count,
-                        &mut fixes_by_label,
-                    )?),
-                    "ret" => Instruction::Ret,
-                    label if label.ends_with(':') => {
-                        let entry = fixes_by_label.entry(label[0..label.len() - 1].to_string());
+                    b"push" => Instruction::Push,
+                    b"pop" => Instruction::Pop,
+                    b"dup" => Instruction::Dup,
+                    b"swap" => Instruction::Swap,
+                    b"ldt" => Instruction::LoadTop,
+                    b"over" => Instruction::Over,
+                    b"inc" => Instruction::Inc,
+                    b"dec" => Instruction::Dec,
+                    b"add" => Instruction::Add,
+                    b"sub" => Instruction::Sub,
+                    b"mul" => Instruction::Mul,
+                    b"div" => Instruction::Div,
+                    b"eq" => Instruction::Eq,
+                    b"neq" => Instruction::Neq,
+                    b"lt" => Instruction::Lt,
+                    b"lte" => Instruction::Lte,
+                    b"gt" => Instruction::Gt,
+                    b"gte" => Instruction::Gte,
+                    b"inv" => Instruction::Inv,
+                    b"jmp" => {
+                        let addr = tokenizer.next_token_slice(source);
+                        Instruction::Jmp(tokenizer.parse_address(
+                            addr,
+                            inst_count,
+                            &mut fixes_by_label,
+                        )?)
+                    }
+                    b"jz" => {
+                        let addr = tokenizer.next_token_slice(source);
+                        Instruction::JumpIfZero(tokenizer.parse_address(
+                            addr,
+                            inst_count,
+                            &mut fixes_by_label,
+                        )?)
+                    }
+                    b"jnz" => {
+                        let addr = tokenizer.next_token_slice(source);
+                        Instruction::JumpIfNotZero(tokenizer.parse_address(
+                            addr,
+                            inst_count,
+                            &mut fixes_by_label,
+                        )?)
+                    }
+                    b"call" => {
+                        let addr = tokenizer.next_token_slice(source);
+                        Instruction::Call(tokenizer.parse_address(
+                            addr,
+                            inst_count,
+                            &mut fixes_by_label,
+                        )?)
+                    }
+                    b"ret" => Instruction::Ret,
+                    label if label.len() > 0 && label[label.len() - 1] == b':' => {
+                        let entry = fixes_by_label
+                            .entry(str::from_utf8(&label[0..label.len() - 1]).expect("valid utf8"));
                         match entry {
                             Entry::Occupied(ent) => {
                                 ent.into_mut().address = Some(inst_count);
@@ -164,13 +197,19 @@ pub fn code_from_str(src: &str, dst: &mut [Instruction]) -> Result<ProgramAddres
                         continue;
                     }
                     inst => Err(AssemblyError {
-                        kind: AssemblyErrorKind::UnknownInstruction(inst.to_string()),
-                        line: linum,
+                        kind: AssemblyErrorKind::UnknownInstruction(
+                            String::from_utf8(inst.to_vec()).expect("valid utf8"),
+                        ),
+                        line: tokenizer.line_num,
                     })?,
                 };
+                inst_count += 1;
+                tokenizer.line_num += 1;
+            }
+            _ => {
+                tokenizer.char_index += 1;
             }
         }
-        inst_count += 1;
     }
     for (_, fix) in fixes_by_label {
         match fix.address {
