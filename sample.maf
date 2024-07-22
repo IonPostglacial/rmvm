@@ -1,0 +1,11 @@
+jmp @start
+
+double:
+    load 2
+    mul
+    ret
+
+start:
+    load 21
+    push
+    call @double
